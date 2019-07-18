@@ -10,6 +10,7 @@ from tempfile import NamedTemporaryFile
 
 import pytz
 from django.core.files import File
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.db.models import Count, Sum
 from django.utils.translation import ugettext_lazy as _
@@ -18,7 +19,10 @@ from lxml import etree
 from lxml.builder import E
 from zeep.exceptions import Fault
 
+import reversion
+
 from . import clients, crypto, exceptions, parsers, serializers
+from django_afip.serializers import _wsfe_factory
 
 logger = logging.getLogger(__name__)
 TZ_AR = pytz.timezone(pytz.country_timezones['ar'][0])
@@ -866,6 +870,64 @@ class ReceiptManager(models.Manager):
         return ReceiptQuerySet(self.model, using=self._db).select_related(
             'receipt_type',
         )
+
+    def fetch_validated_receipt_data(self, point_of_sales, receipt_type, receipt_number):
+        """Returns the number for the last validated receipt."""
+        client = clients.get_client('wsfe', point_of_sales.owner.is_sandboxed)
+
+        f = _wsfe_factory()
+        request = f.FECompConsultaReq(
+            CbteTipo=receipt_type.code,
+            CbteNro=receipt_number,
+            PtoVta=point_of_sales.number
+        )
+
+        response_xml = client.service.FECompConsultar(
+            serializers.serialize_ticket(
+                point_of_sales.owner.get_or_create_ticket('wsfe')
+            ),
+            request
+        )
+        check_response(response_xml)
+        receipt_data = response_xml['ResultGet']
+        return receipt_data
+
+    def import_validated_receipt(self, point_of_sales, receipt_type, receipt_number):
+        if self.filter(receipt_number=receipt_number, point_of_sales=point_of_sales, receipt_type=receipt_type).exists():
+            raise ValidationError('A receipt with the same point of sale, type and number already exists in local DB.')
+        receipt_data = self.fetch_validated_receipt_data(point_of_sales, receipt_type, receipt_number)
+
+        with reversion.create_revision():
+            receipt = self._create_receipt_from_ws_data(receipt_data, point_of_sales, receipt_type) 
+            reversion.set_comment("Imported from FECompConsultar web service")
+
+        return receipt
+
+    def _create_receipt_from_ws_data(self, receipt_data, point_of_sales, receipt_type):
+        receipt = self.create(
+            point_of_sales=point_of_sales,
+            receipt_type=receipt_type,
+            receipt_number=receipt_data['CbteDesde'],
+            document_number=receipt_data['DocNro'],
+            document_type=DocumentType.objects.get(code=receipt_data['DocTipo']),
+            issued_date=parsers.parse_date(receipt_data['CbteFch']),
+            total_amount=receipt_data['ImpTotal'],
+            net_untaxed=receipt_data['ImpTotConc'],
+            net_taxed=receipt_data['ImpNeto'],
+            exempt_amount=receipt_data['ImpOpEx'],
+            currency=CurrencyType.objects.get(code=receipt_data['MonId']),
+            currency_quote=receipt_data['MonCotiz'],
+            concept=ConceptType.objects.get(code=receipt_data['Concepto']),
+        )
+
+        validation = ReceiptValidation.objects.create(
+                    result=ReceiptValidation.RESULT_APPROVED,
+                    cae=receipt_data['CodAutorizacion'],
+                    cae_expiration=parsers.parse_date(receipt_data['FchVto']),
+                    receipt=receipt,
+                    processed_date=parsers.parse_datetime(receipt_data['FchProceso'])
+                )
+        return receipt
 
 
 class Receipt(models.Model):
